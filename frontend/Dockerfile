@@ -14,4 +14,4 @@ COPY --from=builder /app/package*.json ./
 RUN npm ci --omit=dev
 
 EXPOSE 3011
-CMD ["npm", "start"]
+CMD ["sh", "-c", "node_modules/.bin/next start -p ${PORT:-3011}"]
