@@ -2,7 +2,7 @@
 # deploy.sh — build and deploy agent-orchestration-demo to GCP Cloud Run
 # Provisions: Artifact Registry, Cloud Run (backend + frontend)
 # No local Docker required — images built via Cloud Build.
-# Usage: ./scripts/deploy.sh [local]
+# Usage: ./scripts/deploy.sh
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -11,7 +11,14 @@ BACKEND_SVC="agent-backend"
 FRONTEND_SVC="agent-frontend"
 AR_REPO="agent-demo"
 SA_NAME="agent-runner"
-TARGET="${1:-cloud}"
+
+printf '\n  [1] Local  — uvicorn + npm dev, no Docker (Redis via REDIS_URL in .env)\n'
+printf '  [2] Cloud  — build via Cloud Build, deploy to Cloud Run\n\n'
+read -rp 'Choose [1]: ' _MODE
+case "${_MODE:-1}" in
+  2) TARGET="cloud" ;;
+  *) TARGET="local" ;;
+esac
 
 # ── local mode (no Docker) ────────────────────────────────────────────────────
 # Redis runs remotely (deployed Cloud Run stack) or locally via brew.
