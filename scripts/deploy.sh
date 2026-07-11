@@ -2,7 +2,7 @@
 # deploy.sh — build and deploy agent-orchestration-demo to GCP Cloud Run
 # Provisions: Artifact Registry, Cloud Run (backend + frontend)
 # No local Docker required — images built via Cloud Build.
-# Usage: ./scripts/deploy.sh
+# Usage: ./scripts/deploy.sh [local]
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -11,6 +11,50 @@ BACKEND_SVC="agent-backend"
 FRONTEND_SVC="agent-frontend"
 AR_REPO="agent-demo"
 SA_NAME="agent-runner"
+TARGET="${1:-cloud}"
+
+# ── local mode (no Docker) ────────────────────────────────────────────────────
+# Redis runs remotely (deployed Cloud Run stack) or locally via brew.
+# No Docker Compose needed — set REDIS_URL in .env to point at either.
+#
+# Remote Redis (already deployed):  REDIS_URL=<Cloud Run redis URL>
+# Local Redis (brew):               brew install redis && brew services start redis
+#                                   REDIS_URL=redis://localhost:6379
+if [[ "$TARGET" == "local" ]]; then
+  [[ -f "$ROOT/.env" ]] || { echo "Error: .env not found. Copy .env.example and fill in ANTHROPIC_API_KEY and REDIS_URL."; exit 1; }
+  # shellcheck source=/dev/null
+  source "$ROOT/.env"
+  if [[ -z "${REDIS_URL:-}" ]]; then
+    printf '\nREDIS_URL not set in .env.\n'
+    printf '  Remote: add the Redis URL from your deployed Cloud Run stack.\n'
+    printf '  Local:  brew install redis && brew services start redis\n'
+    printf '          then set REDIS_URL=redis://localhost:6379 in .env\n\n'
+    exit 1
+  fi
+
+  cd "$ROOT/backend"
+  [[ -d .venv ]] || python3 -m venv .venv
+  # shellcheck source=/dev/null
+  source .venv/bin/activate
+  pip install -q -r requirements.txt
+  cp "$ROOT/.env" "$ROOT/backend/.env" 2>/dev/null || true
+  uvicorn app.main:app --host 0.0.0.0 --port 8002 --reload &
+  BACKEND_PID=$!
+  echo "Backend  → http://localhost:8002/docs"
+
+  cd "$ROOT/frontend"
+  [[ -d node_modules ]] || npm install
+  grep -E '^(ANTHROPIC|NVIDIA|BACKEND)' "$ROOT/.env" > "$ROOT/frontend/.env.local" 2>/dev/null || true
+  echo "BACKEND_URL=http://localhost:8002" >> "$ROOT/frontend/.env.local"
+  npm run dev &
+  FRONTEND_PID=$!
+  echo "Frontend → http://localhost:3011"
+
+  _cleanup() { kill "$BACKEND_PID" "$FRONTEND_PID" 2>/dev/null || true; }
+  trap _cleanup EXIT INT TERM
+  wait "$BACKEND_PID" "$FRONTEND_PID"
+  exit 0
+fi
 
 # ── gcloud ────────────────────────────────────────────────────────────────────
 if ! command -v gcloud >/dev/null 2>&1; then
