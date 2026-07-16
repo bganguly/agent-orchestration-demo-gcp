@@ -1,7 +1,5 @@
 #!/usr/bin/env bash
-# deploy.sh — build and deploy agent-orchestration-demo to GCP Cloud Run
-# Provisions: Artifact Registry, Cloud Run (backend + frontend)
-# No local Docker required — images built via Cloud Build.
+# deploy.sh — agent-orchestration-demo: local dev, GCP Cloud Run, or AWS ECS
 # Usage: ./scripts/deploy.sh
 set -euo pipefail
 
@@ -12,11 +10,29 @@ FRONTEND_SVC="agent-frontend"
 AR_REPO="agent-demo"
 SA_NAME="agent-runner"
 
-printf '\n  [1] Local  — uvicorn + npm dev, no Docker (Redis via REDIS_URL in .env)\n'
-printf '  [2] Cloud  — build via Cloud Build, deploy to Cloud Run\n\n'
-read -rp 'Choose [1]: ' _MODE
-case "${_MODE:-1}" in
+_aws_tf_ws_count() {
+  local ws="$1"
+  local state_file="$ROOT/infra/aws/terraform.tfstate.d/$ws/terraform.tfstate"
+  [[ -f "$state_file" ]] || { printf '0'; return; }
+  python3 -c "import json; d=json.load(open('$state_file')); print(sum(len(r.get('instances',[])) for r in d.get('resources',[])))" 2>/dev/null || printf '0'
+}
+_aws_lite_count=$(_aws_tf_ws_count lite)
+
+printf '\n=== agent-orchestration-demo ===\n\n'
+printf '  [1] Local  — uvicorn + npm dev, no Docker (Redis via .env)\n'
+printf '  [2] Cloud  — GCP Cloud Run\n'
+printf '  [3] Lite   — AWS: ECS Fargate  (~$20-35/mo if left running)'
+(( _aws_lite_count > 0 )) && printf ' [%s resources active]' "$_aws_lite_count" || printf ' [not deployed]'
+printf '\n\nChoice [1/2/3]: '
+read -r _MODE
+case "$_MODE" in
   2) TARGET="cloud" ;;
+  3) TARGET="aws"; DEPLOY_WORKSPACE="lite"; TF_VAR_name_prefix="agent-lite"
+     TF_VAR_be_task_cpu=512;  TF_VAR_be_task_memory=1024
+     TF_VAR_fe_task_cpu=256;  TF_VAR_fe_task_memory=512
+     export DEPLOY_WORKSPACE TF_VAR_name_prefix TF_VAR_be_task_cpu TF_VAR_be_task_memory
+     export TF_VAR_fe_task_cpu TF_VAR_fe_task_memory
+     ;;
   *) TARGET="local" ;;
 esac
 
@@ -63,7 +79,8 @@ if [[ "$TARGET" == "local" ]]; then
   exit 0
 fi
 
-# ── gcloud ────────────────────────────────────────────────────────────────────
+# ── GCP Cloud Run ─────────────────────────────────────────────────────────────
+if [[ "$TARGET" == "cloud" ]]; then
 if ! command -v gcloud >/dev/null 2>&1; then
   printf '\ngcloud CLI not found.\n'
   if command -v brew >/dev/null 2>&1; then
@@ -208,4 +225,137 @@ ENVEOF
 printf '\n=== Agent Orchestration Demo deployed ===\n'
 printf '  App:  %s\n' "$FRONTEND_URL"
 printf '  API:  %s/docs\n' "$BACKEND_URL"
-printf '\nTear down: ./scripts/infra-down.sh\n'
+printf '\nTear down: ./scripts/infra-down.sh --cloud\n'
+exit 0
+fi
+
+# ── AWS ECS ───────────────────────────────────────────────────────────────────
+printf '\n--- AWS Lite summary ---\n'
+printf '  Backend:  ECS Fargate 0.5 vCPU / 1 GB + Redis sidecar\n'
+printf '  Frontend: ECS Fargate 0.25 vCPU / 0.5 GB\n'
+printf '  Cost est: ~$20-35/mo if left running — TEAR DOWN when done\n'
+printf '\nProceed? [Y/n] '
+read -r _CONFIRM
+[[ -z "$_CONFIRM" || "$_CONFIRM" =~ ^[Yy]$ ]] || { printf 'Aborted.\n'; exit 0; }
+
+echo ""
+echo "[1/4] Checking AWS credentials..."
+if ! aws sts get-caller-identity >/dev/null 2>&1; then
+  printf '  AWS credentials not found or invalid.\n'; exit 1
+fi
+printf '  Credentials valid.\n'
+AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
+echo ""
+echo "[2/4] Provisioning AWS infra (ECS cluster, ALB, ECR, EventBridge)..."
+"$ROOT/scripts/infra-up-aws.sh"
+
+INFRA_DIR="$ROOT/infra/aws"
+cd "$INFRA_DIR"
+terraform workspace select "$DEPLOY_WORKSPACE" >/dev/null
+
+FRONTEND_URL=$(terraform output -raw frontend_url)
+BACKEND_URL=$(terraform output -raw backend_url)
+BE_ECR_URI=$(terraform output -raw backend_ecr_uri)
+FE_ECR_URI=$(terraform output -raw frontend_ecr_uri)
+CLUSTER_NAME=$(terraform output -raw cluster_name)
+BE_SVC=$(terraform output -raw backend_service)
+FE_SVC=$(terraform output -raw frontend_service)
+AWS_REGION=$(terraform output -raw aws_region)
+
+echo ""
+echo "[3/4] Building and pushing Docker images to ECR..."
+if ! docker info >/dev/null 2>&1; then
+  printf '  Docker not running — start Docker Desktop and retry.\n'; exit 1
+fi
+aws ecr get-login-password --region "$AWS_REGION" \
+  | docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+TAG=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || date +%Y%m%d%H%M%S)
+
+printf '  Building backend...\n'
+docker build --platform linux/amd64 -t "${BE_ECR_URI}:${TAG}" "$ROOT/backend"
+docker push "${BE_ECR_URI}:${TAG}"
+
+printf '  Building frontend...\n'
+docker build --platform linux/amd64 \
+  --build-arg NEXT_PUBLIC_BACKEND_URL="$BACKEND_URL" \
+  -t "${FE_ECR_URI}:${TAG}" "$ROOT/frontend"
+docker push "${FE_ECR_URI}:${TAG}"
+
+echo ""
+echo "[4/4] Updating SSM parameters and deploying to ECS..."
+[[ -f "$ROOT/.env" ]] && source "$ROOT/.env" || true
+for _pair in "anthropic-key:${ANTHROPIC_API_KEY:-}" "openai-key:${OPENAI_API_KEY:-}"; do
+  _pname="/${TF_VAR_name_prefix}/${_pair%%:*}"
+  _pval="${_pair#*:}"
+  [[ -z "$_pval" ]] && continue
+  aws ssm put-parameter --name "$_pname" --value "$_pval" \
+    --type SecureString --overwrite --no-cli-pager >/dev/null
+  printf '  Updated SSM: %s\n' "$_pname"
+done
+
+ANTHROPIC_API_KEY=$(aws ssm get-parameter --name "/${TF_VAR_name_prefix}/anthropic-key" --with-decryption --query Parameter.Value --output text 2>/dev/null || echo "")
+OPENAI_API_KEY=$(aws ssm get-parameter --name "/${TF_VAR_name_prefix}/openai-key" --with-decryption --query Parameter.Value --output text 2>/dev/null || echo "")
+
+_register_task_def() {
+  local family="$1" image="$2" extra_env="$3"
+  local cur_def
+  cur_def=$(aws ecs describe-task-definition --task-definition "$family" --output json 2>/dev/null \
+    | python3 -c "import json,sys; td=json.load(sys.stdin)['taskDefinition']; \
+      [td.pop(k,None) for k in ['taskDefinitionArn','revision','status','requiresAttributes','compatibilities','registeredAt','registeredBy','deregisteredAt']]; \
+      print(json.dumps(td))" 2>/dev/null || echo "")
+  [[ -z "$cur_def" ]] && { printf '  Task definition %s not found.\n' "$family"; return 1; }
+  local new_def
+  new_def=$(printf '%s' "$cur_def" | python3 - "$image" "$extra_env" <<'PYEOF'
+import json, sys
+image, extra_env_json = sys.argv[1], sys.argv[2]
+td = json.load(sys.stdin)
+extra_env = json.loads(extra_env_json) if extra_env_json else []
+app = next((c for c in td['containerDefinitions'] if c['name'] == 'app'), None)
+if app:
+    app['image'] = image
+    existing = {e['name'] for e in app.get('environment', [])}
+    for e in extra_env:
+        if e['name'] not in existing:
+            app.setdefault('environment', []).append(e)
+print(json.dumps(td))
+PYEOF
+)
+  aws ecs register-task-definition --cli-input-json "$new_def" \
+    --query "taskDefinition.taskDefinitionArn" --output text --no-cli-pager
+}
+
+BE_EXTRA=$(python3 -c "import json; print(json.dumps([e for e in [
+  {'name':'REDIS_URL','value':'redis://localhost:6379'},
+  {'name':'ANTHROPIC_API_KEY','value':'${ANTHROPIC_API_KEY}'},
+  {'name':'OPENAI_API_KEY','value':'${OPENAI_API_KEY}'},
+] if e['value']]))")
+BE_TASK_ARN=$(_register_task_def "${TF_VAR_name_prefix}-backend" "${BE_ECR_URI}:${TAG}" "$BE_EXTRA")
+FE_EXTRA=$(python3 -c "import json; print(json.dumps([e for e in [
+  {'name':'BACKEND_URL','value':'${BACKEND_URL}'},
+  {'name':'ANTHROPIC_API_KEY','value':'${ANTHROPIC_API_KEY}'},
+  {'name':'OPENAI_API_KEY','value':'${OPENAI_API_KEY}'},
+] if e['value']]))")
+FE_TASK_ARN=$(_register_task_def "${TF_VAR_name_prefix}-frontend" "${FE_ECR_URI}:${TAG}" "$FE_EXTRA")
+
+aws ecs update-service --cluster "$CLUSTER_NAME" --service "$BE_SVC" \
+  --task-definition "$BE_TASK_ARN" --force-new-deployment --no-cli-pager >/dev/null
+aws ecs update-service --cluster "$CLUSTER_NAME" --service "$FE_SVC" \
+  --task-definition "$FE_TASK_ARN" --force-new-deployment --no-cli-pager >/dev/null
+
+printf '\n  Waiting for services to stabilize...\n'
+aws ecs wait services-stable --cluster "$CLUSTER_NAME" --services "$BE_SVC" "$FE_SVC" \
+  --region "$AWS_REGION" || printf '  (wait timed out — check ECS console)\n'
+
+printf '\n✓ Agent Orchestration Demo live on AWS\n'
+printf '  App:         %s\n' "$FRONTEND_URL"
+printf '  API Docs:    %s/docs\n' "$BACKEND_URL"
+printf '  Schedule:    8 am \xc2\xb7 5 pm PT weekdays\n'
+printf '  Tear down:   ./scripts/infra-down.sh --aws\n'
+
+PORTFOLIO_SET_LIVE="$(cd "$ROOT/../../portfolio/scripts" 2>/dev/null && pwd || true)/set-live-url.sh"
+if [[ -f "$PORTFOLIO_SET_LIVE" ]]; then
+  printf '\n  Updating portfolio live-urls.js...\n'
+  bash "$PORTFOLIO_SET_LIVE" --tier "lite" agent "$FRONTEND_URL" "${BACKEND_URL}/docs"
+fi
