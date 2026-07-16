@@ -6,7 +6,13 @@ via LangGraph's `Send` API. Every agent step streams to the browser as SSE event
 answer appears. The same tools are also exposed as an **MCP server** over stdio — connectable from
 Claude Desktop, Claude Code, or any MCP-compatible client.
 
-Sister repo: [rag-pgvector-demo](https://github.com/bganguly/rag-pgvector-demo)
+**[→ Portfolio demo](https://bganguly.github.io/?open=agent)**
+
+## Using the App
+
+1. Enter a question in the chat input — simple queries route directly to retrieval; complex or multi-part questions decompose into parallel sub-queries.
+2. Watch the StepTracker panel as each agent step (classify → decompose → retrieve → synthesize) advances live via SSE — pending / active (⟳) / done (✓) with retrieved detail.
+3. The answer streams in after all steps complete.
 
 ---
 
