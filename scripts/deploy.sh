@@ -187,9 +187,10 @@ gcloud run deploy "$BACKEND_SVC" \
   --region="$GCP_REGION" \
   --project="$GCP_PROJECT" \
   --service-account="$SA_EMAIL" \
-  --set-env-vars="ANTHROPIC_API_KEY=${ANTHROPIC_KEY},OPENAI_API_KEY=${OPENAI_KEY}" \
+  --set-env-vars="ANTHROPIC_API_KEY=${ANTHROPIC_KEY},OPENAI_API_KEY=${OPENAI_KEY},CORS_ORIGINS=*" \
   --allow-unauthenticated \
-  --min-instances=1 \
+  --min-instances=0 \
+  --timeout=300 \
   --quiet
 
 BACKEND_URL=$(gcloud run services describe "$BACKEND_SVC" \
@@ -206,7 +207,7 @@ gcloud run deploy "$FRONTEND_SVC" \
   --service-account="$SA_EMAIL" \
   --set-env-vars="BACKEND_URL=${BACKEND_URL},ANTHROPIC_API_KEY=${ANTHROPIC_KEY}" \
   --allow-unauthenticated \
-  --min-instances=1 \
+  --min-instances=0 \
   --quiet
 
 FRONTEND_URL=$(gcloud run services describe "$FRONTEND_SVC" \

@@ -1,37 +1,47 @@
 "use client";
 
 import { useState, useRef } from "react";
-import StepTracker, { Step, makeSteps } from "@/components/StepTracker";
+import dynamic from "next/dynamic";
+import type { FlowNode } from "@/components/AgentGraph";
+
+const AgentGraph = dynamic(() => import("@/components/AgentGraph"), { ssr: false });
 
 const EXAMPLE_QUERIES = [
-  "How does the Federal Reserve control inflation through interest rates?",
-  "What is quantitative easing and how does it affect GDP?",
-  "Compare fiscal policy and monetary policy approaches to recession.",
+  { label: "AI in drug discovery", query: "What is the impact of artificial intelligence on drug discovery and pharmaceutical development?" },
+  { label: "Climate & food security", query: "How does climate change affect global food security and agricultural systems worldwide?" },
+  { label: "EV industry disruption", query: "Analyze the rise of electric vehicles and their impact on the automotive industry and global energy sector." },
+];
+
+const SIMPLE_QUERIES = [
+  { label: "mRNA vaccines", query: "How does mRNA vaccine technology work?" },
+  { label: "History of the internet", query: "What is the history of the internet?" },
 ];
 
 export default function Home() {
   const [query, setQuery] = useState("");
-  const [steps, setSteps] = useState<Step[]>(makeSteps());
+  const [flowNodes, setFlowNodes] = useState<FlowNode[]>([]);
   const [answer, setAnswer] = useState("");
   const [running, setRunning] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
 
-  function resetState() {
-    setSteps(makeSteps());
+  function reset() {
+    setFlowNodes([]);
     setAnswer("");
   }
 
-  function markStep(node: string, status: "active" | "done", detail?: string) {
-    setSteps((prev) =>
-      prev.map((s) =>
-        s.node === node ? { ...s, status, detail: detail ?? s.detail } : s
-      )
-    );
+  function upsertNode(partial: Partial<FlowNode> & { id: string }) {
+    setFlowNodes((prev) => {
+      const existing = prev.find((n) => n.id === partial.id);
+      if (existing) {
+        return prev.map((n) => (n.id === partial.id ? { ...n, ...partial } : n));
+      }
+      return [...prev, { label: partial.label ?? partial.id, layer: partial.layer ?? 0, parent: partial.parent ?? null, status: partial.status ?? "running", ...partial }];
+    });
   }
 
   async function runAgent(q: string) {
     if (running) return;
-    resetState();
+    reset();
     setRunning(true);
     abortRef.current = new AbortController();
 
@@ -61,12 +71,17 @@ export default function Home() {
           if (payload === "[DONE]") break;
 
           try {
-            const event = JSON.parse(payload);
-            if (event.type === "step_start") markStep(event.node, "active");
-            if (event.type === "step_done") markStep(event.node, "done", event.detail);
-            if (event.type === "answer") setAnswer(event.text);
+            const ev = JSON.parse(payload);
+
+            if (ev.type === "step_start") {
+              upsertNode({ id: ev.node, label: ev.label, layer: ev.layer, parent: ev.parent, status: "running" });
+            } else if (ev.type === "step_done") {
+              upsertNode({ id: ev.node, label: ev.label, layer: ev.layer, parent: ev.parent, status: "done", detail: ev.detail });
+            } else if (ev.type === "answer") {
+              setAnswer(ev.text);
+            }
           } catch {
-            // malformed line — skip
+            // malformed line
           }
         }
       }
@@ -84,98 +99,118 @@ export default function Home() {
     if (query.trim()) runAgent(query.trim());
   }
 
+  const doneCount = flowNodes.filter((n) => n.status === "done").length;
+  const totalCount = flowNodes.length;
+
   return (
-    <div className="flex flex-col h-screen">
-      <header
-        className="px-6 py-3 border-b"
-        style={{ background: "var(--surface)", borderColor: "var(--border)" }}
-      >
-        <span
-          className="text-xs font-mono tracking-widest uppercase"
-          style={{ color: "var(--accent)" }}
+    <div style={{ display: "flex", flexDirection: "column", height: "100vh", overflow: "hidden" }}>
+      {/* Header */}
+      <header style={{ padding: "10px 20px", borderBottom: "1px solid var(--border)", background: "var(--surface)", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <div>
+          <span style={{ fontSize: 10, fontFamily: "monospace", letterSpacing: "0.1em", textTransform: "uppercase", color: "var(--accent)" }}>
+            Agent Orchestration Demo
+          </span>
+          <h1 style={{ fontSize: 14, fontWeight: 600, color: "var(--text)", margin: 0 }}>
+            LangGraph · Multi-agent research · MCP server
+          </h1>
+        </div>
+        <a
+          href="/api-explorer.html"
+          target="_blank"
+          style={{ fontSize: 11, padding: "4px 10px", borderRadius: 6, border: "1px solid var(--border)", color: "var(--text-2)", textDecoration: "none" }}
         >
-          Agent Orchestration Demo
-        </span>
-        <h1 className="text-base font-semibold" style={{ color: "var(--text)" }}>
-          LangGraph · Multi-agent routing · MCP server
-        </h1>
+          API Explorer ↗
+        </a>
       </header>
 
-      <div
-        className="px-6 py-3 border-b"
-        style={{ borderColor: "var(--border)", background: "var(--surface)" }}
-      >
-        <form onSubmit={handleSubmit} className="flex gap-2">
+      {/* Input bar */}
+      <div style={{ padding: "10px 20px", borderBottom: "1px solid var(--border)", background: "var(--surface)", flexShrink: 0 }}>
+        <form onSubmit={handleSubmit} style={{ display: "flex", gap: 8, marginBottom: 8 }}>
           <input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder="Ask a complex research question…"
-            className="flex-1 rounded px-3 py-2 text-sm"
-            style={{
-              background: "var(--bg)",
-              border: "1px solid var(--border)",
-              color: "var(--text)",
-            }}
+            placeholder="Ask a research question — complex queries activate up to 17 agents…"
+            style={{ flex: 1, borderRadius: 6, padding: "7px 12px", fontSize: 13, background: "var(--bg)", border: "1px solid var(--border)", color: "var(--text)", outline: "none" }}
           />
           <button
             type="submit"
             disabled={running || !query.trim()}
-            className="px-5 py-2 rounded text-sm font-medium transition-opacity"
-            style={{
-              background: "var(--accent)",
-              color: "#fff",
-              opacity: running || !query.trim() ? 0.5 : 1,
-            }}
+            style={{ padding: "7px 18px", borderRadius: 6, fontSize: 13, fontWeight: 500, background: "var(--accent)", color: "#fff", border: "none", cursor: running || !query.trim() ? "not-allowed" : "pointer", opacity: running || !query.trim() ? 0.5 : 1 }}
           >
             {running ? "Running…" : "Run"}
           </button>
         </form>
 
-        <div className="flex gap-2 mt-2 flex-wrap">
-          {EXAMPLE_QUERIES.map((q) => (
-            <button
-              key={q}
-              onClick={() => { setQuery(q); runAgent(q); }}
-              className="text-xs px-2 py-1 rounded"
-              style={{ border: "1px solid var(--border)", color: "var(--text-2)" }}
-            >
-              {q.length > 60 ? q.slice(0, 58) + "…" : q}
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+          <span style={{ fontSize: 10, color: "var(--text-2)", marginRight: 2 }}>complex →</span>
+          {EXAMPLE_QUERIES.map((ex) => (
+            <button key={ex.label} onClick={() => { setQuery(ex.query); runAgent(ex.query); }}
+              style={{ fontSize: 11, padding: "3px 8px", borderRadius: 5, border: "1px solid var(--border)", color: "var(--text-2)", background: "transparent", cursor: "pointer" }}>
+              {ex.label}
+            </button>
+          ))}
+          <span style={{ fontSize: 10, color: "var(--text-2)", marginLeft: 6, marginRight: 2 }}>simple →</span>
+          {SIMPLE_QUERIES.map((ex) => (
+            <button key={ex.label} onClick={() => { setQuery(ex.query); runAgent(ex.query); }}
+              style={{ fontSize: 11, padding: "3px 8px", borderRadius: 5, border: "1px solid var(--border)", color: "var(--text-2)", background: "transparent", cursor: "pointer" }}>
+              {ex.label}
             </button>
           ))}
         </div>
       </div>
 
-      <div className="flex flex-1 overflow-hidden">
-        <div
-          className="w-72 shrink-0 border-r overflow-y-auto"
-          style={{ background: "var(--surface)", borderColor: "var(--border)" }}
-        >
-          <StepTracker steps={steps} />
+      {/* Main — graph left, answer right */}
+      <div style={{ flex: 1, display: "flex", overflow: "hidden" }}>
+        {/* DAG canvas */}
+        <div style={{ flex: "0 0 62%", position: "relative", borderRight: "1px solid var(--border)" }}>
+          {/* Status bar */}
+          {totalCount > 0 && (
+            <div style={{ position: "absolute", top: 10, left: 12, zIndex: 10, fontSize: 10, fontFamily: "monospace", color: "var(--text-2)", background: "var(--surface)", padding: "3px 8px", borderRadius: 4, border: "1px solid var(--border)" }}>
+              {running ? `${doneCount} / ${totalCount} agents done` : `${totalCount} agents · complete`}
+            </div>
+          )}
+
+          {flowNodes.length === 0 ? (
+            <div style={{ height: "100%", display: "flex", alignItems: "center", justifyContent: "center", flexDirection: "column", gap: 10, color: "var(--text-2)" }}>
+              <svg width="48" height="48" viewBox="0 0 48 48" fill="none">
+                <circle cx="24" cy="10" r="5" stroke="currentColor" strokeWidth="1.5" />
+                <circle cx="10" cy="32" r="5" stroke="currentColor" strokeWidth="1.5" />
+                <circle cx="24" cy="32" r="5" stroke="currentColor" strokeWidth="1.5" />
+                <circle cx="38" cy="32" r="5" stroke="currentColor" strokeWidth="1.5" />
+                <line x1="24" y1="15" x2="10" y2="27" stroke="currentColor" strokeWidth="1.5" />
+                <line x1="24" y1="15" x2="24" y2="27" stroke="currentColor" strokeWidth="1.5" />
+                <line x1="24" y1="15" x2="38" y2="27" stroke="currentColor" strokeWidth="1.5" />
+              </svg>
+              <p style={{ fontSize: 12, margin: 0 }}>Agent graph appears here as the pipeline runs</p>
+              <p style={{ fontSize: 11, margin: 0, opacity: 0.7 }}>Complex queries spawn up to 17 nodes in parallel</p>
+            </div>
+          ) : (
+            <AgentGraph flowNodes={flowNodes} />
+          )}
         </div>
 
-        <div className="flex-1 overflow-y-auto p-6">
-          {!answer && !running && (
-            <p className="text-sm" style={{ color: "var(--text-2)" }}>
-              Select an example query or type your own. The agent will classify it,
-              optionally decompose it into sub-queries, retrieve context in parallel,
-              then synthesize a grounded answer.
-            </p>
+        {/* Answer panel */}
+        <div style={{ flex: 1, overflowY: "auto", padding: 20 }}>
+          {!answer && !running && flowNodes.length === 0 && (
+            <div style={{ color: "var(--text-2)", fontSize: 13, lineHeight: 1.7 }}>
+              <p style={{ marginBottom: 12 }}>Select an example or type a question. The pipeline:</p>
+              <ol style={{ paddingLeft: 18, fontSize: 12, display: "flex", flexDirection: "column", gap: 6 }}>
+                <li><strong style={{ color: "var(--text)" }}>Planner</strong> — classifies query, selects 2–10 specialist researchers</li>
+                <li><strong style={{ color: "var(--text)" }}>Researchers ×N</strong> — parallel Wikipedia + DuckDuckGo per domain</li>
+                <li><strong style={{ color: "var(--text)" }}>Synthesizers ×4</strong> — clinical, business, policy, societal (complex only)</li>
+                <li><strong style={{ color: "var(--text)" }}>Fact Check</strong> — validates key claims (complex only)</li>
+                <li><strong style={{ color: "var(--text)" }}>Report Writer</strong> — final structured answer</li>
+              </ol>
+            </div>
           )}
           {running && !answer && (
-            <p className="text-sm animate-pulse" style={{ color: "var(--text-2)" }}>
-              Agent working…
+            <p style={{ color: "var(--text-2)", fontSize: 13, animation: "pulse 1.5s ease-in-out infinite" }}>
+              Agents working…
             </p>
           )}
           {answer && (
-            <div
-              className="prose max-w-none rounded-lg p-5 text-sm leading-relaxed"
-              style={{
-                background: "var(--surface)",
-                border: "1px solid var(--border)",
-                color: "var(--text)",
-              }}
-            >
-              <p className="whitespace-pre-wrap">{answer}</p>
+            <div style={{ fontSize: 13, lineHeight: 1.75, color: "var(--text)", whiteSpace: "pre-wrap" }}>
+              {answer}
             </div>
           )}
         </div>

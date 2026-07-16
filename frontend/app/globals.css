@@ -37,3 +37,18 @@ body {
   color: var(--text);
   font-family: system-ui, -apple-system, sans-serif;
 }
+
+/* React Flow dark-mode overrides */
+.react-flow__background { background: transparent !important; }
+.react-flow__controls button {
+  background: var(--surface) !important;
+  border-color: var(--border) !important;
+  color: var(--text-2) !important;
+}
+.react-flow__controls button:hover { background: var(--pending-bg) !important; }
+.react-flow__minimap { background: var(--surface) !important; }
+
+@keyframes nodePulse {
+  0%, 100% { box-shadow: 0 0 0 2px color-mix(in srgb, var(--active) 25%, transparent); }
+  50%       { box-shadow: 0 0 0 5px color-mix(in srgb, var(--active) 10%, transparent); }
+}

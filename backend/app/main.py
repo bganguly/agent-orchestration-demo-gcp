@@ -1,13 +1,16 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.config import settings
 from app.routes import agent
 
-app = FastAPI(title="Agent Orchestration API", version="1.0.0")
+app = FastAPI(title="Agent Orchestration API", version="2.0.0")
+
+_origins = [o.strip() for o in settings.cors_origins.split(",")]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3011"],
+    allow_origins=_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

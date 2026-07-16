@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>API Explorer — Agent Orchestration Demo</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0a0d16; color: #c8d0e8; font-family: 'Inter', system-ui, sans-serif; font-size: 13px; min-height: 100vh; }
+    .mono { font-family: 'JetBrains Mono', monospace; }
+    .glass { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.07); border-radius: 10px; }
+    header { padding: 18px 28px; border-bottom: 1px solid rgba(255,255,255,0.07); display: flex; align-items: center; gap: 14px; }
+    .badge { background: rgba(74,143,214,0.15); border: 1px solid rgba(74,143,214,0.3); color: #4a8fd6; border-radius: 4px; font-size: 10px; font-weight: 600; padding: 2px 8px; letter-spacing: .05em; text-transform: uppercase; font-family: 'JetBrains Mono', monospace; }
+    h1 { font-size: 15px; font-weight: 600; color: #e8eaf6; }
+    .sub { font-size: 11px; color: #4a5880; margin-top: 1px; }
+    main { max-width: 860px; margin: 0 auto; padding: 28px 20px; display: flex; flex-direction: column; gap: 20px; }
+
+    .endpoint { border-radius: 10px; border: 1px solid rgba(255,255,255,0.07); background: rgba(255,255,255,0.02); overflow: hidden; }
+    .ep-header { padding: 14px 18px; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid rgba(255,255,255,0.06); }
+    .method { font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 700; padding: 2px 10px; border-radius: 99px; letter-spacing: .04em; }
+    .GET  { background: rgba(16,185,129,0.12); border: 1px solid rgba(16,185,129,0.28); color: #34d399; }
+    .POST { background: rgba(74,143,214,0.12); border: 1px solid rgba(74,143,214,0.28); color: #7db8f0; }
+    .path { font-family: 'JetBrains Mono', monospace; font-size: 12px; color: #8892b0; }
+    .ep-desc { font-size: 11px; color: #4a5880; margin-left: auto; }
+    .ep-body { padding: 16px 18px; display: flex; flex-direction: column; gap: 12px; }
+
+    label { font-size: 11px; color: #6a7898; font-weight: 500; display: block; margin-bottom: 4px; }
+    textarea, input[type="text"] {
+      width: 100%; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.08);
+      color: #c8d0e8; border-radius: 7px; padding: 8px 11px;
+      font-family: 'JetBrains Mono', monospace; font-size: 12px; resize: vertical;
+      outline: none; transition: border-color .15s;
+    }
+    textarea:focus, input[type="text"]:focus { border-color: rgba(74,143,214,0.5); }
+    textarea { min-height: 64px; }
+
+    .run-btn {
+      display: inline-flex; align-items: center; gap: 7px; padding: 7px 16px;
+      border-radius: 7px; font-size: 12px; font-weight: 600; cursor: pointer;
+      background: rgba(74,143,214,0.12); border: 1px solid rgba(74,143,214,0.35);
+      color: #7db8f0; transition: all .15s; white-space: nowrap;
+    }
+    .run-btn:hover { background: rgba(74,143,214,0.22); }
+    .run-btn:disabled { opacity: .4; cursor: not-allowed; }
+
+    .result-box { border-radius: 8px; border: 1px solid rgba(255,255,255,0.06); background: rgba(0,0,0,0.25); overflow: hidden; }
+    .result-head { padding: 8px 14px; border-bottom: 1px solid rgba(255,255,255,0.05); display: flex; align-items: center; gap: 10px; }
+    .status-chip { font-family: 'JetBrains Mono', monospace; font-size: 10px; font-weight: 600; padding: 1px 8px; border-radius: 99px; }
+    .s200 { background: rgba(16,185,129,0.12); border: 1px solid rgba(16,185,129,0.25); color: #34d399; }
+    .sSSE { background: rgba(74,143,214,0.12); border: 1px solid rgba(74,143,214,0.25); color: #7db8f0; }
+    .serr { background: rgba(239,68,68,0.12); border: 1px solid rgba(239,68,68,0.25); color: #f87171; }
+    .timing { font-size: 10px; color: #4a5880; margin-left: auto; }
+    .result-body { padding: 12px 14px; max-height: 380px; overflow-y: auto; }
+
+    /* SSE event stream */
+    .sse-stream { display: flex; flex-direction: column; gap: 3px; }
+    .sse-event { font-family: 'JetBrains Mono', monospace; font-size: 11px; padding: 4px 8px; border-radius: 5px; line-height: 1.5; }
+    .sse-start  { background: rgba(74,143,214,0.06); border-left: 2px solid #4a8fd6; color: #7db8f0; }
+    .sse-done   { background: rgba(16,185,129,0.06); border-left: 2px solid #34d399; color: #34d399; }
+    .sse-answer { background: rgba(168,85,247,0.06); border-left: 2px solid #a855f7; color: #c4b5fd; white-space: pre-wrap; word-break: break-word; }
+    .sse-meta   { background: rgba(255,255,255,0.02); border-left: 2px solid #4a5880; color: #4a5880; }
+    .sse-done-all { background: rgba(255,255,255,0.02); border-left: 2px solid #4a5880; color: #4a5880; font-style: italic; }
+
+    /* JSON result */
+    .raw-json { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: #6a7898; white-space: pre; line-height: 1.6; }
+
+    .examples { display: flex; flex-wrap: wrap; gap: 6px; }
+    .ex-btn { font-size: 11px; padding: 3px 9px; border-radius: 5px; border: 1px solid rgba(255,255,255,0.08); color: #6a7898; background: transparent; cursor: pointer; transition: all .12s; }
+    .ex-btn:hover { border-color: rgba(74,143,214,0.4); color: #7db8f0; }
+
+    .empty-state { color: #3a4565; font-size: 12px; font-family: 'JetBrains Mono', monospace; text-align: center; padding: 24px 0; }
+    .spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid rgba(74,143,214,0.25); border-top-color: #4a8fd6; border-radius: 50%; animation: spin .6s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+<header>
+  <span class="badge">v2</span>
+  <div>
+    <h1>API Explorer — Agent Orchestration</h1>
+    <div class="sub">LangGraph · Multi-agent research pipeline · MCP server</div>
+  </div>
+</header>
+
+<main>
+  <!-- POST /api/agent/run -->
+  <div class="endpoint">
+    <div class="ep-header">
+      <span class="method POST">POST</span>
+      <span class="path">/api/agent/run</span>
+      <span class="ep-desc">SSE stream · up to 17 agent activations</span>
+    </div>
+    <div class="ep-body">
+      <div>
+        <label>QUERY</label>
+        <textarea id="run-query" rows="2">What is the impact of artificial intelligence on drug discovery and pharmaceutical development?</textarea>
+      </div>
+      <div>
+        <label>EXAMPLES</label>
+        <div class="examples">
+          <button class="ex-btn" onclick="setQuery('What is the impact of artificial intelligence on drug discovery and pharmaceutical development?')">AI drug discovery (complex)</button>
+          <button class="ex-btn" onclick="setQuery('How does climate change affect global food security and agricultural systems worldwide?')">Climate &amp; food security (complex)</button>
+          <button class="ex-btn" onclick="setQuery('Analyze the rise of electric vehicles and their impact on the automotive industry.')">EV disruption (complex)</button>
+          <button class="ex-btn" onclick="setQuery('How does mRNA vaccine technology work?')">mRNA vaccines (simple)</button>
+          <button class="ex-btn" onclick="setQuery('What is the history of the internet?')">History of internet (simple)</button>
+        </div>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <button class="run-btn" id="run-btn" onclick="runAgent()">
+          <span>▶ Run</span>
+        </button>
+        <button class="run-btn" id="stop-btn" style="display:none" onclick="stopAgent()">■ Stop</button>
+      </div>
+      <div id="run-result" style="display:none" class="result-box">
+        <div class="result-head">
+          <span class="status-chip sSSE" id="run-status">SSE</span>
+          <span id="run-agent-count" style="font-size:10px;color:#4a5880"></span>
+          <span class="timing" id="run-timing"></span>
+        </div>
+        <div class="result-body">
+          <div class="sse-stream" id="run-stream"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- GET /health -->
+  <div class="endpoint">
+    <div class="ep-header">
+      <span class="method GET">GET</span>
+      <span class="path">/health</span>
+      <span class="ep-desc">Liveness check</span>
+    </div>
+    <div class="ep-body">
+      <div style="display:flex;gap:8px">
+        <button class="run-btn" onclick="runHealth()">▶ Run</button>
+      </div>
+      <div id="health-result" style="display:none" class="result-box">
+        <div class="result-head">
+          <span class="status-chip" id="health-status">—</span>
+          <span class="timing" id="health-timing"></span>
+        </div>
+        <div class="result-body"><pre class="raw-json" id="health-body"></pre></div>
+      </div>
+    </div>
+  </div>
+</main>
+
+<script>
+  let _abortCtrl = null;
+  let _agentCount = 0;
+  let _doneCount = 0;
+
+  function setQuery(q) { document.getElementById('run-query').value = q; }
+
+  function appendEvent(type, text) {
+    const stream = document.getElementById('run-stream');
+    const div = document.createElement('div');
+    div.className = 'sse-event ' + type;
+    div.textContent = text;
+    stream.appendChild(div);
+    stream.parentElement.scrollTop = stream.parentElement.scrollHeight;
+  }
+
+  async function runAgent() {
+    const query = document.getElementById('run-query').value.trim();
+    if (!query) return;
+
+    _agentCount = 0; _doneCount = 0;
+    document.getElementById('run-stream').innerHTML = '';
+    document.getElementById('run-result').style.display = 'block';
+    document.getElementById('run-status').className = 'status-chip sSSE';
+    document.getElementById('run-status').textContent = 'streaming';
+    document.getElementById('run-agent-count').textContent = '';
+    document.getElementById('run-timing').textContent = '';
+    document.getElementById('run-btn').disabled = true;
+    document.getElementById('stop-btn').style.display = 'inline-flex';
+
+    _abortCtrl = new AbortController();
+    const t0 = Date.now();
+
+    try {
+      const res = await fetch('/api/agent', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query }),
+        signal: _abortCtrl.signal,
+      });
+
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        const lines = buf.split('\n');
+        buf = lines.pop() ?? '';
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const raw = line.slice(6).trim();
+          if (raw === '[DONE]') {
+            appendEvent('sse-done-all', '[DONE]');
+            break;
+          }
+          try {
+            const ev = JSON.parse(raw);
+            if (ev.type === 'step_start') {
+              _agentCount++;
+              appendEvent('sse-start', `→ ${ev.node}  [layer ${ev.layer}]  "${ev.label}"`);
+              document.getElementById('run-agent-count').textContent = `${_agentCount} agents activated`;
+            } else if (ev.type === 'step_done') {
+              _doneCount++;
+              appendEvent('sse-done', `✓ ${ev.node}  — ${ev.detail || 'done'}`);
+              document.getElementById('run-agent-count').textContent = `${_doneCount}/${_agentCount} agents done`;
+            } else if (ev.type === 'answer') {
+              appendEvent('sse-meta', '── answer ──');
+              appendEvent('sse-answer', ev.text);
+            }
+          } catch {}
+        }
+      }
+
+      const elapsed = ((Date.now() - t0) / 1000).toFixed(1);
+      document.getElementById('run-status').className = 'status-chip s200';
+      document.getElementById('run-status').textContent = 'done';
+      document.getElementById('run-timing').textContent = `${elapsed}s · ${_agentCount} agents`;
+
+    } catch (err) {
+      if (err.name !== 'AbortError') {
+        appendEvent('sse-meta', 'Error: ' + err.message);
+        document.getElementById('run-status').className = 'status-chip serr';
+        document.getElementById('run-status').textContent = 'error';
+      }
+    } finally {
+      document.getElementById('run-btn').disabled = false;
+      document.getElementById('stop-btn').style.display = 'none';
+    }
+  }
+
+  function stopAgent() {
+    _abortCtrl?.abort();
+    appendEvent('sse-meta', '[aborted]');
+    document.getElementById('run-status').className = 'status-chip serr';
+    document.getElementById('run-status').textContent = 'aborted';
+    document.getElementById('run-btn').disabled = false;
+    document.getElementById('stop-btn').style.display = 'none';
+  }
+
+  async function runHealth() {
+    const t0 = Date.now();
+    try {
+      const res = await fetch('/health');
+      const data = await res.json();
+      const elapsed = Date.now() - t0;
+      document.getElementById('health-result').style.display = 'block';
+      const chip = document.getElementById('health-status');
+      chip.className = 'status-chip ' + (res.ok ? 's200' : 'serr');
+      chip.textContent = res.status;
+      document.getElementById('health-timing').textContent = elapsed + 'ms';
+      document.getElementById('health-body').textContent = JSON.stringify(data, null, 2);
+    } catch (e) {
+      document.getElementById('health-result').style.display = 'block';
+      document.getElementById('health-status').className = 'status-chip serr';
+      document.getElementById('health-status').textContent = 'error';
+      document.getElementById('health-body').textContent = e.message;
+    }
+  }
+</script>
+</body>
+</html>
