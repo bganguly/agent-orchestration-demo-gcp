@@ -1,0 +1,62 @@
+steps:
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        gcloud container clusters get-credentials "$_CLUSTER" \
+          --zone "$_ZONE" --project "$PROJECT_ID"
+
+        kubectl scale deployment/agent-backend -n agent-demo --replicas=0 2>/dev/null || true
+
+        sed -e "s|IMAGE_PLACEHOLDER|$_IMAGE|g" namespace.yaml  | kubectl apply -f -
+        sed -e "s|IMAGE_PLACEHOLDER|$_IMAGE|g" deployment.yaml | kubectl apply -f -
+        sed -e "s|IMAGE_PLACEHOLDER|$_IMAGE|g" service.yaml    | kubectl apply -f -
+
+        ANTHROPIC_KEY=$$(gcloud secrets versions access latest \
+          --secret="agent-anthropic-key" --project="$PROJECT_ID")
+
+        kubectl create secret generic agent-api-keys \
+          --from-literal=anthropic_api_key="$$ANTHROPIC_KEY" \
+          -n agent-demo \
+          --dry-run=client -o yaml | kubectl apply -f -
+
+        _heartbeat() {
+          local n=0
+          while true; do
+            sleep 30
+            n=$(( n + 1 ))
+            echo "--- heartbeat ${n} (agent-backend) ---"
+            kubectl get pods -n agent-demo -l app=agent-backend -o wide --no-headers 2>/dev/null || true
+            for pod in $$(kubectl get pods -n agent-demo -l app=agent-backend \
+                -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+              echo "  [pod: $$pod]"
+              kubectl logs "$$pod" -n agent-demo --tail=20 2>/dev/null || true
+            done
+          done
+        }
+        _heartbeat &
+        _HB_PID=$$!
+
+        if ! kubectl rollout status deployment/agent-backend \
+            --namespace agent-demo --timeout=300s; then
+          kill "$$_HB_PID" 2>/dev/null || true
+          echo "=== rollout timed out — diagnostics ==="
+          kubectl get pods -n agent-demo -o wide
+          kubectl get events -n agent-demo --sort-by='.lastTimestamp' | tail -20
+          kubectl describe pods -n agent-demo -l app=agent-backend | tail -40
+          for pod in $$(kubectl get pods -n agent-demo -l app=agent-backend \
+              -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
+            echo "  [pod: $$pod]"
+            kubectl logs "$$pod" -n agent-demo --tail=50 2>/dev/null || true
+          done
+          exit 1
+        fi
+        kill "$$_HB_PID" 2>/dev/null || true
+
+timeout: 600s
+substitutions:
+  _IMAGE: ''
+  _CLUSTER: agent-demo-cluster
+  _ZONE: us-central1-a

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# deploy.sh — agent-orchestration-demo: local dev, GCP Cloud Run, or AWS ECS
+# deploy.sh — agent-orchestration-demo: local dev or GCP (Cloud Run / GKE)
 # Usage: ./scripts/deploy.sh
 set -euo pipefail
 
@@ -9,43 +9,39 @@ BACKEND_SVC="agent-backend"
 FRONTEND_SVC="agent-frontend"
 AR_REPO="agent-demo"
 SA_NAME="agent-runner"
+GKE_CLUSTER="agent-demo-cluster"
 
-_aws_tf_ws_count() {
-  local ws="$1"
-  local state_file="$ROOT/infra/aws/terraform.tfstate.d/$ws/terraform.tfstate"
-  [[ -f "$state_file" ]] || { printf '0'; return; }
-  python3 -c "import json; d=json.load(open('$state_file')); print(sum(len(r.get('instances',[])) for r in d.get('resources',[])))" 2>/dev/null || printf '0'
-}
-_aws_lite_count=$(_aws_tf_ws_count lite)
+_local_running=0
+lsof -ti:8002 >/dev/null 2>&1 && _local_running=1 || true
+_gcp_deployed=0
+[[ -f "$ENV_FILE" ]] && _gcp_deployed=1 || true
+_current_runtime="cr"
+if [[ -f "$ENV_FILE" ]]; then
+  _cr=$(grep '^BACKEND_RUNTIME=' "$ENV_FILE" 2>/dev/null | cut -d= -f2 || true)
+  _current_runtime="${_cr:-cr}"
+fi
 
 printf '\n=== agent-orchestration-demo ===\n\n'
-printf '  [1] Local  — uvicorn + npm dev, no Docker (Redis via .env)\n'
-printf '  [2] Cloud  — GCP Cloud Run\n'
-printf '  [3] Lite   — AWS: ECS Fargate  (~$20-35/mo if left running)'
-(( _aws_lite_count > 0 )) && printf ' [%s resources active]' "$_aws_lite_count" || printf ' [not deployed]'
-printf '\n\nChoice [1/2/3]: '
+printf '  [1] Local  — uvicorn + npm dev, no Docker (Redis via .env)'
+(( _local_running )) && printf ' [running]' || printf ' [not detected]'
+printf '\n'
+printf '  [2] Cloud  — GCP'
+if (( _gcp_deployed )); then
+  printf ' [deployed: %s]' "$_current_runtime"
+else
+  printf ' [not deployed]'
+fi
+printf '\n'
+printf '\nChoice [1/2]: '
 read -r _MODE
 case "$_MODE" in
   2) TARGET="cloud" ;;
-  3) TARGET="aws"; DEPLOY_WORKSPACE="lite"; TF_VAR_name_prefix="agent-lite"
-     TF_VAR_be_task_cpu=512;  TF_VAR_be_task_memory=1024
-     TF_VAR_fe_task_cpu=256;  TF_VAR_fe_task_memory=512
-     export DEPLOY_WORKSPACE TF_VAR_name_prefix TF_VAR_be_task_cpu TF_VAR_be_task_memory
-     export TF_VAR_fe_task_cpu TF_VAR_fe_task_memory
-     ;;
   *) TARGET="local" ;;
 esac
 
 # ── local mode (no Docker) ────────────────────────────────────────────────────
-# Redis runs remotely (deployed Cloud Run stack) or locally via brew.
-# No Docker Compose needed — set REDIS_URL in .env to point at either.
-#
-# Remote Redis (already deployed):  REDIS_URL=<Cloud Run redis URL>
-# Local Redis (brew):               brew install redis && brew services start redis
-#                                   REDIS_URL=redis://localhost:6379
 if [[ "$TARGET" == "local" ]]; then
   [[ -f "$ROOT/.env" ]] || { echo "Error: .env not found. Copy .env.example and fill in ANTHROPIC_API_KEY and REDIS_URL."; exit 1; }
-  # shellcheck source=/dev/null
   source "$ROOT/.env"
   if [[ -z "${REDIS_URL:-}" ]]; then
     printf '\nREDIS_URL not set in .env.\n'
@@ -57,7 +53,6 @@ if [[ "$TARGET" == "local" ]]; then
 
   cd "$ROOT/backend"
   [[ -d .venv ]] || python3 -m venv .venv
-  # shellcheck source=/dev/null
   source .venv/bin/activate
   pip install -q -r requirements.txt
   cp "$ROOT/.env" "$ROOT/backend/.env" 2>/dev/null || true
@@ -79,8 +74,23 @@ if [[ "$TARGET" == "local" ]]; then
   exit 0
 fi
 
-# ── GCP Cloud Run ─────────────────────────────────────────────────────────────
-if [[ "$TARGET" == "cloud" ]]; then
+# ── Cloud mode: choose backend runtime ────────────────────────────────────────
+printf '\n  Backend runtime:\n'
+printf '  [1] Cloud Run — serverless, scales to zero\n'
+printf '  [2] GKE       — Kubernetes on e2-standard-2 node (~$50/mo while running)\n'
+if [[ "$_current_runtime" == "gke" ]]; then
+  printf '\nChoice [1/2, default 2 — gke (current)]: '
+else
+  printf '\nChoice [1/2, default 1 — cr]: '
+fi
+read -r _BR
+case "$_BR" in
+  1) BACKEND_RUNTIME="cr" ;;
+  2) BACKEND_RUNTIME="gke" ;;
+  *) BACKEND_RUNTIME="$_current_runtime" ;;
+esac
+
+# ── gcloud check ──────────────────────────────────────────────────────────────
 if ! command -v gcloud >/dev/null 2>&1; then
   printf '\ngcloud CLI not found.\n'
   if command -v brew >/dev/null 2>&1; then
@@ -109,19 +119,16 @@ GCP_PROJECT="${_CONFIG_PROJECT:-${GCP_PROJECT:-}}"
 [[ -n "$GCP_PROJECT" ]] || { printf 'Set GCP_PROJECT or: gcloud config set project <id>\n' >&2; exit 1; }
 _CONFIG_REGION=$(gcloud config get-value compute/region 2>/dev/null || true)
 GCP_REGION="${_CONFIG_REGION:-${GCP_REGION:-us-central1}}"
-printf '\n=== deployment config ===\n  Project: %s\n  Region:  %s\n' "$GCP_PROJECT" "$GCP_REGION"
+printf '\n=== deployment config ===\n  Project: %s\n  Region:  %s\n  Runtime: %s\n' "$GCP_PROJECT" "$GCP_REGION" "$BACKEND_RUNTIME"
 
 _GIT_HASH=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || true)
 TAG="${_GIT_HASH:+${_GIT_HASH}-}$(date +%Y%m%d%H%M%S)"
 
 # ── enable APIs ───────────────────────────────────────────────────────────────
 printf '\nEnabling APIs...\n'
-gcloud services enable \
-  artifactregistry.googleapis.com \
-  run.googleapis.com \
-  cloudbuild.googleapis.com \
-  secretmanager.googleapis.com \
-  --project "$GCP_PROJECT" --quiet
+_APIS="artifactregistry.googleapis.com run.googleapis.com cloudbuild.googleapis.com secretmanager.googleapis.com"
+[[ "$BACKEND_RUNTIME" == "gke" ]] && _APIS="$_APIS container.googleapis.com"
+gcloud services enable $_APIS --project "$GCP_PROJECT" --quiet
 
 # ── Artifact Registry ─────────────────────────────────────────────────────────
 if ! gcloud artifacts repositories describe "$AR_REPO" \
@@ -167,7 +174,7 @@ upsert_secret agent-openai-key    "${OPENAI_API_KEY:-}"
 ANTHROPIC_KEY=$(gcloud secrets versions access latest --secret=agent-anthropic-key --project="$GCP_PROJECT" 2>/dev/null || echo "")
 OPENAI_KEY=$(gcloud secrets versions access latest --secret=agent-openai-key --project="$GCP_PROJECT" 2>/dev/null || echo "")
 
-# ── build images via Cloud Build (no local Docker required) ───────────────────
+# ── build images via Cloud Build ──────────────────────────────────────────────
 printf '\n[1/2] building backend via Cloud Build...\n'
 gcloud builds submit \
   --tag "$BACKEND_IMAGE" \
@@ -180,25 +187,85 @@ gcloud builds submit \
   --project "$GCP_PROJECT" \
   "$ROOT/frontend"
 
+_GKE_ZONE="${GCP_REGION}-a"
+
 # ── deploy backend ────────────────────────────────────────────────────────────
-printf '\nDeploying %s to Cloud Run...\n' "$BACKEND_SVC"
-gcloud run deploy "$BACKEND_SVC" \
-  --image="$BACKEND_IMAGE" \
-  --region="$GCP_REGION" \
-  --project="$GCP_PROJECT" \
-  --service-account="$SA_EMAIL" \
-  --set-env-vars="ANTHROPIC_API_KEY=${ANTHROPIC_KEY},OPENAI_API_KEY=${OPENAI_KEY},CORS_ORIGINS=*" \
-  --allow-unauthenticated \
-  --min-instances=0 \
-  --timeout=300 \
-  --quiet
+if [[ "$BACKEND_RUNTIME" == "gke" ]]; then
 
-BACKEND_URL=$(gcloud run services describe "$BACKEND_SVC" \
-  --region="$GCP_REGION" --project="$GCP_PROJECT" \
-  --format="value(status.url)")
-printf '  Backend: %s\n' "$BACKEND_URL"
+  if gcloud container clusters describe "$GKE_CLUSTER" \
+      --zone "$_GKE_ZONE" --project "$GCP_PROJECT" >/dev/null 2>&1; then
+    printf '\n  GKE cluster %s already exists.\n' "$GKE_CLUSTER"
+    _CURRENT_NODES=$(gcloud container clusters describe "$GKE_CLUSTER" \
+      --zone "$_GKE_ZONE" --project "$GCP_PROJECT" \
+      --format="value(currentNodeCount)" 2>/dev/null || echo "0")
+    if [[ "${_CURRENT_NODES:-0}" == "0" ]]; then
+      printf '  Cluster at 0 nodes — scaling up to 1...\n'
+      gcloud container clusters resize "$GKE_CLUSTER" \
+        --node-pool default-pool --num-nodes 1 \
+        --zone "$_GKE_ZONE" --project "$GCP_PROJECT" --quiet
+      printf '  Node coming up — waiting 60s for readiness...\n'
+      sleep 60
+    fi
+  else
+    printf '\n  Creating GKE cluster %s (e2-standard-2, 1 node)...\n' "$GKE_CLUSTER"
+    gcloud container clusters create "$GKE_CLUSTER" \
+      --zone "$_GKE_ZONE" --project "$GCP_PROJECT" \
+      --machine-type e2-standard-2 --num-nodes 1 \
+      --quiet
+  fi
 
-# ── deploy frontend ───────────────────────────────────────────────────────────
+  printf '\n  Deploying to GKE via Cloud Build...\n'
+  gcloud builds submit \
+    --config "${ROOT}/cloudbuild-gke.yaml" \
+    --project "$GCP_PROJECT" \
+    --substitutions "_IMAGE=${BACKEND_IMAGE},_CLUSTER=${GKE_CLUSTER},_ZONE=${_GKE_ZONE}" \
+    "${ROOT}/k8s"
+
+  printf '  Waiting for LoadBalancer IP...\n'
+  gcloud container clusters get-credentials "$GKE_CLUSTER" \
+    --zone "$_GKE_ZONE" --project "$GCP_PROJECT" --quiet
+  _LB_IP=""
+  for _i in $(seq 1 60); do
+    _LB_IP=$(kubectl get svc agent-backend -n agent-demo \
+      -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)
+    [[ -n "$_LB_IP" ]] && break
+    printf '  waiting for LoadBalancer (%d/60)...\n' "$_i"; sleep 10
+  done
+  [[ -n "$_LB_IP" ]] || { printf 'ERROR: LoadBalancer IP never assigned.\n' >&2; exit 1; }
+  BACKEND_URL="http://${_LB_IP}"
+  printf '  Backend (GKE): %s\n' "$BACKEND_URL"
+
+else
+
+  printf '\nDeploying %s to Cloud Run...\n' "$BACKEND_SVC"
+  gcloud run deploy "$BACKEND_SVC" \
+    --image="$BACKEND_IMAGE" \
+    --region="$GCP_REGION" \
+    --project="$GCP_PROJECT" \
+    --service-account="$SA_EMAIL" \
+    --set-env-vars="ANTHROPIC_API_KEY=${ANTHROPIC_KEY},OPENAI_API_KEY=${OPENAI_KEY},CORS_ORIGINS=*" \
+    --allow-unauthenticated \
+    --min-instances=0 \
+    --timeout=300 \
+    --quiet
+
+  BACKEND_URL=$(gcloud run services describe "$BACKEND_SVC" \
+    --region="$GCP_REGION" --project="$GCP_PROJECT" \
+    --format="value(status.url)")
+  printf '  Backend (Cloud Run): %s\n' "$BACKEND_URL"
+
+  if gcloud container clusters describe "$GKE_CLUSTER" \
+      --zone "$_GKE_ZONE" --project "$GCP_PROJECT" >/dev/null 2>&1; then
+    printf '  Switched to Cloud Run — scaling GKE cluster to 0 nodes...\n'
+    gcloud container clusters resize "$GKE_CLUSTER" \
+      --node-pool default-pool --num-nodes 0 \
+      --zone "$_GKE_ZONE" --project "$GCP_PROJECT" --quiet
+    printf '  GKE cluster preserved at 0 nodes — no node charges until next GKE deploy.\n'
+  fi
+
+fi
+
+# ── deploy frontend (always Cloud Run) ───────────────────────────────────────
 printf '\nDeploying %s to Cloud Run...\n' "$FRONTEND_SVC"
 gcloud run deploy "$FRONTEND_SVC" \
   --image="$FRONTEND_IMAGE" \
@@ -219,6 +286,7 @@ cat > "$ENV_FILE" <<ENVEOF
 GCP_PROJECT=${GCP_PROJECT}
 GCP_REGION=${GCP_REGION}
 AR_REPO=${AR_REPO}
+BACKEND_RUNTIME=${BACKEND_RUNTIME}
 BACKEND_URL=${BACKEND_URL}
 FRONTEND_URL=${FRONTEND_URL}
 ENVEOF
@@ -226,137 +294,23 @@ ENVEOF
 printf '\n=== Agent Orchestration Demo deployed ===\n'
 printf '  App:  %s\n' "$FRONTEND_URL"
 printf '  API:  %s/docs\n' "$BACKEND_URL"
-printf '\nTear down: ./scripts/infra-down.sh --cloud\n'
-exit 0
+
+# ── GKE: scale down outside working hours ─────────────────────────────────────
+if [[ "$BACKEND_RUNTIME" == "gke" ]]; then
+  _HOUR_PST=$(TZ="America/Los_Angeles" date +%H)
+  _DOW_PST=$(TZ="America/Los_Angeles" date +%u)
+  _OUTSIDE=0
+  (( 10#$_HOUR_PST < 8 || 10#$_HOUR_PST >= 17 )) && _OUTSIDE=1 || true
+  (( _DOW_PST >= 6 )) && _OUTSIDE=1 || true
+  if (( _OUTSIDE )); then
+    printf '\n=== outside working hours — scaling GKE nodes to 0 ===\n'
+    gcloud container clusters resize "$GKE_CLUSTER" \
+      --node-pool default-pool --num-nodes 0 \
+      --zone "$_GKE_ZONE" --project "$GCP_PROJECT" --quiet
+    printf '  Nodes stopped — app unreachable until next 8am PST weekday.\n'
+  else
+    printf '\n  GKE nodes active (within 8am-5pm PST weekdays).\n'
+  fi
 fi
 
-# ── AWS ECS ───────────────────────────────────────────────────────────────────
-printf '\n--- AWS Lite summary ---\n'
-printf '  Backend:  ECS Fargate 0.5 vCPU / 1 GB + Redis sidecar\n'
-printf '  Frontend: ECS Fargate 0.25 vCPU / 0.5 GB\n'
-printf '  Cost est: ~$20-35/mo if left running — TEAR DOWN when done\n'
-printf '\nProceed? [Y/n] '
-read -r _CONFIRM
-[[ -z "$_CONFIRM" || "$_CONFIRM" =~ ^[Yy]$ ]] || { printf 'Aborted.\n'; exit 0; }
-
-echo ""
-echo "[1/4] Checking AWS credentials..."
-if ! aws sts get-caller-identity >/dev/null 2>&1; then
-  printf '  AWS credentials not found or invalid.\n'; exit 1
-fi
-printf '  Credentials valid.\n'
-AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-
-echo ""
-echo "[2/4] Provisioning AWS infra (ECS cluster, ALB, ECR, EventBridge)..."
-"$ROOT/scripts/infra-up-aws.sh"
-
-INFRA_DIR="$ROOT/infra/aws"
-cd "$INFRA_DIR"
-terraform workspace select "$DEPLOY_WORKSPACE" >/dev/null
-
-FRONTEND_URL=$(terraform output -raw frontend_url)
-BACKEND_URL=$(terraform output -raw backend_url)
-BE_ECR_URI=$(terraform output -raw backend_ecr_uri)
-FE_ECR_URI=$(terraform output -raw frontend_ecr_uri)
-CLUSTER_NAME=$(terraform output -raw cluster_name)
-BE_SVC=$(terraform output -raw backend_service)
-FE_SVC=$(terraform output -raw frontend_service)
-AWS_REGION=$(terraform output -raw aws_region)
-
-echo ""
-echo "[3/4] Building and pushing Docker images to ECR..."
-if ! docker info >/dev/null 2>&1; then
-  printf '  Docker not running — start Docker Desktop and retry.\n'; exit 1
-fi
-aws ecr get-login-password --region "$AWS_REGION" \
-  | docker login --username AWS --password-stdin "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-
-TAG=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || date +%Y%m%d%H%M%S)
-
-printf '  Building backend...\n'
-docker build --platform linux/amd64 -t "${BE_ECR_URI}:${TAG}" "$ROOT/backend"
-docker push "${BE_ECR_URI}:${TAG}"
-
-printf '  Building frontend...\n'
-docker build --platform linux/amd64 \
-  --build-arg NEXT_PUBLIC_BACKEND_URL="$BACKEND_URL" \
-  -t "${FE_ECR_URI}:${TAG}" "$ROOT/frontend"
-docker push "${FE_ECR_URI}:${TAG}"
-
-echo ""
-echo "[4/4] Updating SSM parameters and deploying to ECS..."
-[[ -f "$ROOT/.env" ]] && source "$ROOT/.env" || true
-for _pair in "anthropic-key:${ANTHROPIC_API_KEY:-}" "openai-key:${OPENAI_API_KEY:-}"; do
-  _pname="/${TF_VAR_name_prefix}/${_pair%%:*}"
-  _pval="${_pair#*:}"
-  [[ -z "$_pval" ]] && continue
-  aws ssm put-parameter --name "$_pname" --value "$_pval" \
-    --type SecureString --overwrite --no-cli-pager >/dev/null
-  printf '  Updated SSM: %s\n' "$_pname"
-done
-
-ANTHROPIC_API_KEY=$(aws ssm get-parameter --name "/${TF_VAR_name_prefix}/anthropic-key" --with-decryption --query Parameter.Value --output text 2>/dev/null || echo "")
-OPENAI_API_KEY=$(aws ssm get-parameter --name "/${TF_VAR_name_prefix}/openai-key" --with-decryption --query Parameter.Value --output text 2>/dev/null || echo "")
-
-_register_task_def() {
-  local family="$1" image="$2" extra_env="$3"
-  local cur_def
-  cur_def=$(aws ecs describe-task-definition --task-definition "$family" --output json 2>/dev/null \
-    | python3 -c "import json,sys; td=json.load(sys.stdin)['taskDefinition']; \
-      [td.pop(k,None) for k in ['taskDefinitionArn','revision','status','requiresAttributes','compatibilities','registeredAt','registeredBy','deregisteredAt']]; \
-      print(json.dumps(td))" 2>/dev/null || echo "")
-  [[ -z "$cur_def" ]] && { printf '  Task definition %s not found.\n' "$family"; return 1; }
-  local new_def
-  new_def=$(printf '%s' "$cur_def" | python3 - "$image" "$extra_env" <<'PYEOF'
-import json, sys
-image, extra_env_json = sys.argv[1], sys.argv[2]
-td = json.load(sys.stdin)
-extra_env = json.loads(extra_env_json) if extra_env_json else []
-app = next((c for c in td['containerDefinitions'] if c['name'] == 'app'), None)
-if app:
-    app['image'] = image
-    existing = {e['name'] for e in app.get('environment', [])}
-    for e in extra_env:
-        if e['name'] not in existing:
-            app.setdefault('environment', []).append(e)
-print(json.dumps(td))
-PYEOF
-)
-  aws ecs register-task-definition --cli-input-json "$new_def" \
-    --query "taskDefinition.taskDefinitionArn" --output text --no-cli-pager
-}
-
-BE_EXTRA=$(python3 -c "import json; print(json.dumps([e for e in [
-  {'name':'REDIS_URL','value':'redis://localhost:6379'},
-  {'name':'ANTHROPIC_API_KEY','value':'${ANTHROPIC_API_KEY}'},
-  {'name':'OPENAI_API_KEY','value':'${OPENAI_API_KEY}'},
-] if e['value']]))")
-BE_TASK_ARN=$(_register_task_def "${TF_VAR_name_prefix}-backend" "${BE_ECR_URI}:${TAG}" "$BE_EXTRA")
-FE_EXTRA=$(python3 -c "import json; print(json.dumps([e for e in [
-  {'name':'BACKEND_URL','value':'${BACKEND_URL}'},
-  {'name':'ANTHROPIC_API_KEY','value':'${ANTHROPIC_API_KEY}'},
-  {'name':'OPENAI_API_KEY','value':'${OPENAI_API_KEY}'},
-] if e['value']]))")
-FE_TASK_ARN=$(_register_task_def "${TF_VAR_name_prefix}-frontend" "${FE_ECR_URI}:${TAG}" "$FE_EXTRA")
-
-aws ecs update-service --cluster "$CLUSTER_NAME" --service "$BE_SVC" \
-  --task-definition "$BE_TASK_ARN" --force-new-deployment --no-cli-pager >/dev/null
-aws ecs update-service --cluster "$CLUSTER_NAME" --service "$FE_SVC" \
-  --task-definition "$FE_TASK_ARN" --force-new-deployment --no-cli-pager >/dev/null
-
-printf '\n  Waiting for services to stabilize...\n'
-aws ecs wait services-stable --cluster "$CLUSTER_NAME" --services "$BE_SVC" "$FE_SVC" \
-  --region "$AWS_REGION" || printf '  (wait timed out — check ECS console)\n'
-
-printf '\n✓ Agent Orchestration Demo live on AWS\n'
-printf '  App:         %s\n' "$FRONTEND_URL"
-printf '  API Docs:    %s/docs\n' "$BACKEND_URL"
-printf '  Schedule:    8 am \xc2\xb7 5 pm PT weekdays\n'
-printf '  Tear down:   ./scripts/infra-down.sh --aws\n'
-
-PORTFOLIO_SET_LIVE="$(cd "$ROOT/../../portfolio/scripts" 2>/dev/null && pwd || true)/set-live-url.sh"
-if [[ -f "$PORTFOLIO_SET_LIVE" ]]; then
-  printf '\n  Updating portfolio live-urls.js...\n'
-  bash "$PORTFOLIO_SET_LIVE" --tier "lite" agent "$FRONTEND_URL" "${BACKEND_URL}/docs"
-fi
+printf '\nTear down: ./scripts/infra-down.sh\n'
