@@ -140,6 +140,8 @@ curl -X POST http://localhost:8002/api/agent/run \
 
 ## Live Services
 
+> **Schedule:** ECS Fargate runs weekdays 8 am – 5 pm PT. Outside those hours the app is offline — [request access](https://bganguly.github.io/?open=agent) for off-hours access.
+
 | Service | Local |
 |---|---|
 | Next.js app | http://localhost:3011 |
