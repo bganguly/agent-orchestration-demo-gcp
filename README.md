@@ -48,20 +48,19 @@ MCP path (Claude Desktop or Claude Code):
 
 ---
 
-## Local Dev
+## Running
 
 ```bash
-./scripts/local-dev.sh
+./scripts/deploy.sh      # local [1] or GCP Cloud Run / GKE [2]
+./scripts/infra-down.sh  # stop local [1] or delete Cloud Run services [--cloud]
 ```
 
-Starts Docker Compose (redis), installs Python deps in a venv, starts FastAPI on `:8002`,
-installs Node deps, starts Next.js on `:3011`.
+Prerequisites for local:
+- **Python 3.12+** and **Node 20+**
+- Copy `.env.example` → `.env` and fill in `ANTHROPIC_API_KEY`
+- Local Redis: `brew install redis && brew services start redis`, then set `REDIS_URL=redis://localhost:6379` in `.env`
 
-Prerequisites checked at startup:
-- **Docker** — for redis
-- **Python 3.12+** — venv created automatically inside `backend/`
-- **Node 20+** — `npm install` run automatically inside `frontend/`
-- **`.env`** — created from `.env.example` on first run; fill in `ANTHROPIC_API_KEY`
+Cloud Run deploy requires `gcloud` CLI authenticated (`gcloud auth login`) with a project set.
 
 ---
 
@@ -83,37 +82,6 @@ Add to `~/.claude/claude_desktop_config.json`:
 ```
 
 Then restart Claude Desktop — the `wikipedia_search` and `duckduckgo_search` tools appear in the tool list.
-
----
-
-## Tear Down
-
-```bash
-./scripts/infra-down.sh   # stops and removes Docker volumes
-```
-
----
-
-## Deploy
-
-```bash
-./scripts/deploy.sh
-```
-
-Provisions on GCP (no local Docker required — images built via Cloud Build):
-
-- **Artifact Registry** — Docker image repo
-- **Cloud Run** — backend (FastAPI) and frontend (Next.js), each as independent services
-- **Secret Manager** — stores API keys; injected at runtime
-
-Prerequisites: `gcloud` CLI authenticated (`gcloud auth login`) and a project set
-(`gcloud config set project <id>`). API keys are read from your local `.env` and pushed
-to Secret Manager on first deploy.
-
-```bash
-./scripts/infra-down.sh          # stop local Docker
-./scripts/infra-down.sh --cloud  # delete Cloud Run services
-```
 
 ---
 
@@ -142,7 +110,7 @@ curl -X POST http://localhost:8002/api/agent/run \
 
 > **Schedule:** ECS Fargate runs weekdays 8 am – 5 pm PT. Outside those hours the app is offline — [request access](https://bganguly.github.io/?open=agent) for off-hours access.
 
-| Service | Local |
-|---|---|
-| Next.js app | http://localhost:3011 |
-| FastAPI docs | http://localhost:8002/docs |
+| Service | Local | Cloud Run |
+|---|---|---|
+| Next.js app | http://localhost:3011 | https://agent-frontend-77y7e2wykq-uc.a.run.app |
+| FastAPI docs | http://localhost:8002/docs | https://agent-backend-77y7e2wykq-uc.a.run.app/docs |
