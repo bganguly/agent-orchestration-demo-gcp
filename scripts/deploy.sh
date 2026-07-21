@@ -2,6 +2,9 @@
 # deploy.sh — agent-orchestration-demo: local dev or GCP (Cloud Run / GKE)
 # Usage: ./scripts/deploy.sh
 set -euo pipefail
+_STEP="startup"
+_on_exit() { local c=$?; [[ $c -ne 0 ]] && printf '\n[deploy.sh] ABORTED (exit %d) at step: %s\n' "$c" "$_STEP" >&2; }
+trap _on_exit EXIT
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="$ROOT/.env.gcp"
@@ -32,8 +35,9 @@ else
   printf ' [not deployed]'
 fi
 printf '\n'
-printf '\nChoice [1/2]: '
+printf '\nChoice [1/2, default 2]: '
 read -r _MODE
+_MODE="${_MODE:-2}"
 case "$_MODE" in
   2) TARGET="cloud" ;;
   *) TARGET="local" ;;
@@ -112,6 +116,12 @@ if [[ -z "$ACTIVE_ACCOUNT" ]]; then
 fi
 printf '\nAuthenticated as: %s\n' "$ACTIVE_ACCOUNT"
 
+printf '  Checking Application Default Credentials...\n'
+if ! gcloud auth application-default print-access-token >/dev/null 2>&1; then
+  printf '  Setting up Application Default Credentials...\n'
+  gcloud auth application-default login
+fi
+
 # ── project / region ──────────────────────────────────────────────────────────
 [[ -f "$ENV_FILE" ]] && source "$ENV_FILE"
 _CONFIG_PROJECT=$(gcloud config get-value project 2>/dev/null || true)
@@ -121,16 +131,22 @@ _CONFIG_REGION=$(gcloud config get-value compute/region 2>/dev/null || true)
 GCP_REGION="${_CONFIG_REGION:-${GCP_REGION:-us-central1}}"
 printf '\n=== deployment config ===\n  Project: %s\n  Region:  %s\n  Runtime: %s\n' "$GCP_PROJECT" "$GCP_REGION" "$BACKEND_RUNTIME"
 
-_GIT_HASH=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || true)
-TAG="${_GIT_HASH:+${_GIT_HASH}-}$(date +%Y%m%d%H%M%S)"
+_shasum() { shasum -a 256 "$@" 2>/dev/null || sha256sum "$@" 2>/dev/null; }
+TAG=$(find "$ROOT/backend" "$ROOT/frontend" -type f \
+  \( -name "*.py" -o -name "*.ts" -o -name "*.tsx" -o -name "*.js" \
+     -o -name "Dockerfile" -o -name "requirements.txt" -o -name "package.json" \) \
+  | sort | xargs cat 2>/dev/null | _shasum | cut -c1-16 || true)
+TAG="${TAG:-$(date +%Y%m%d%H%M%S)}"
 
 # ── enable APIs ───────────────────────────────────────────────────────────────
+_STEP="enable APIs"
 printf '\nEnabling APIs...\n'
 _APIS="artifactregistry.googleapis.com run.googleapis.com cloudbuild.googleapis.com secretmanager.googleapis.com"
 [[ "$BACKEND_RUNTIME" == "gke" ]] && _APIS="$_APIS container.googleapis.com"
 gcloud services enable $_APIS --project "$GCP_PROJECT" --quiet
 
 # ── Artifact Registry ─────────────────────────────────────────────────────────
+_STEP="artifact registry"
 if ! gcloud artifacts repositories describe "$AR_REPO" \
      --project="$GCP_PROJECT" --location="$GCP_REGION" &>/dev/null; then
   printf '\nCreating Artifact Registry repo %s...\n' "$AR_REPO"
@@ -144,6 +160,7 @@ BACKEND_IMAGE="${AR_HOST}/${GCP_PROJECT}/${AR_REPO}/${BACKEND_SVC}:${TAG}"
 FRONTEND_IMAGE="${AR_HOST}/${GCP_PROJECT}/${AR_REPO}/${FRONTEND_SVC}:${TAG}"
 
 # ── service account ───────────────────────────────────────────────────────────
+_STEP="service account"
 SA_EMAIL="${SA_NAME}@${GCP_PROJECT}.iam.gserviceaccount.com"
 if ! gcloud iam service-accounts describe "$SA_EMAIL" --project="$GCP_PROJECT" &>/dev/null; then
   printf '\nCreating service account %s...\n' "$SA_EMAIL"
@@ -156,9 +173,15 @@ gcloud projects add-iam-policy-binding "$GCP_PROJECT" \
   --role="roles/secretmanager.secretAccessor" --quiet 2>/dev/null || true
 
 # ── API key secrets ───────────────────────────────────────────────────────────
+_STEP="secrets"
 function upsert_secret() {
   local NAME="$1" VALUE="$2"
   [[ -z "$VALUE" ]] && return
+  local _EXISTING
+  _EXISTING=$(gcloud secrets versions access latest --secret="$NAME" --project="$GCP_PROJECT" 2>/dev/null || true)
+  if [[ "$_EXISTING" == "$VALUE" ]]; then
+    printf '  Secret %s unchanged — skipping.\n' "$NAME"; return
+  fi
   if gcloud secrets describe "$NAME" --project="$GCP_PROJECT" &>/dev/null; then
     echo -n "$VALUE" | gcloud secrets versions add "$NAME" --data-file=- --project="$GCP_PROJECT"
   else
@@ -175,21 +198,52 @@ ANTHROPIC_KEY=$(gcloud secrets versions access latest --secret=agent-anthropic-k
 OPENAI_KEY=$(gcloud secrets versions access latest --secret=agent-openai-key --project="$GCP_PROJECT" 2>/dev/null || echo "")
 
 # ── build images via Cloud Build ──────────────────────────────────────────────
-printf '\n[1/2] building backend via Cloud Build...\n'
-gcloud builds submit \
-  --tag "$BACKEND_IMAGE" \
-  --project "$GCP_PROJECT" \
-  "$ROOT/backend"
+_cloudbuild_submit() {
+  local tag="$1" project="$2" srcdir="$3"
+  local attempt=0
+  while (( attempt < 3 )); do
+    attempt=$(( attempt + 1 ))
+    set +e
+    gcloud builds submit --tag "$tag" --project "$project" "$srcdir"
+    local rc=$?
+    set -e
+    [[ "$rc" == "0" ]] && return 0
+    [[ "$rc" == "130" ]] && { printf '\n[deploy] Build cancelled.\n'; exit 130; }
+    if (( attempt < 3 )); then
+      printf '  Cloud Build submit failed (attempt %d/3) — waiting 20s...\n' "$attempt"
+      sleep 20
+    fi
+  done
+  printf '[deploy] Cloud Build failed after 3 attempts.\n' >&2
+  return 1
+}
 
-printf '\n[2/2] building frontend via Cloud Build...\n'
-gcloud builds submit \
-  --tag "$FRONTEND_IMAGE" \
-  --project "$GCP_PROJECT" \
-  "$ROOT/frontend"
+_ar_tag_exists() {
+  gcloud artifacts docker tags list "${AR_HOST}/${GCP_PROJECT}/${AR_REPO}/$1" \
+    --filter="tag=$2" --format="value(tag)" \
+    --project "$GCP_PROJECT" 2>/dev/null | grep -q .
+}
+
+_STEP="build backend"
+if _ar_tag_exists "$BACKEND_SVC" "$TAG"; then
+  printf '\n[1/2] backend image %s already in AR — skipping build.\n' "$TAG"
+else
+  printf '\n[1/2] building backend via Cloud Build...\n'
+  _cloudbuild_submit "$BACKEND_IMAGE" "$GCP_PROJECT" "$ROOT/backend"
+fi
+
+_STEP="build frontend"
+if _ar_tag_exists "$FRONTEND_SVC" "$TAG"; then
+  printf '\n[2/2] frontend image %s already in AR — skipping build.\n' "$TAG"
+else
+  printf '\n[2/2] building frontend via Cloud Build...\n'
+  _cloudbuild_submit "$FRONTEND_IMAGE" "$GCP_PROJECT" "$ROOT/frontend"
+fi
 
 _GKE_ZONE="${GCP_REGION}-a"
 
 # ── deploy backend ────────────────────────────────────────────────────────────
+_STEP="deploy backend"
 if [[ "$BACKEND_RUNTIME" == "gke" ]]; then
 
   if gcloud container clusters describe "$GKE_CLUSTER" \
@@ -266,6 +320,7 @@ else
 fi
 
 # ── deploy frontend (always Cloud Run) ───────────────────────────────────────
+_STEP="deploy frontend"
 printf '\nDeploying %s to Cloud Run...\n' "$FRONTEND_SVC"
 gcloud run deploy "$FRONTEND_SVC" \
   --image="$FRONTEND_IMAGE" \
@@ -312,5 +367,56 @@ if [[ "$BACKEND_RUNTIME" == "gke" ]]; then
     printf '\n  GKE nodes active (within 8am-5pm PST weekdays).\n'
   fi
 fi
+
+# ── post-deploy health checks ─────────────────────────────────────────────────
+_STEP="health checks"
+printf '\n=== post-deploy checks ===\n'
+_CP=0; _CF=0
+_chk() {
+  local n="$1" label="$2" ok="$3" detail="${4:-}"
+  if [[ "$ok" == "1" ]]; then
+    printf '  [%s] PASS  %s%s\n' "$n" "$label" "${detail:+  ($detail)}"
+    _CP=$(( _CP + 1 ))
+  else
+    printf '  [%s] FAIL  %s%s\n' "$n" "$label" "${detail:+  — $detail}"
+    _CF=$(( _CF + 1 ))
+  fi
+}
+
+if [[ "$BACKEND_RUNTIME" != "gke" ]]; then
+  _CR_BACKEND=$(gcloud run services describe "$BACKEND_SVC" \
+    --region="$GCP_REGION" --project="$GCP_PROJECT" \
+    --format="value(status.conditions[0].status)" 2>/dev/null || echo "unknown")
+  [[ "$_CR_BACKEND" == "True" ]] \
+    && _chk 1 "Cloud Run backend ready" 1 \
+    || _chk 1 "Cloud Run backend ready" 0 "status: ${_CR_BACKEND}"
+else
+  _GKE_READY=$(kubectl get deployment "agent-backend" -n "agent-demo" \
+    -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+  [[ "${_GKE_READY:-0}" -ge 1 ]] \
+    && _chk 1 "GKE deployment ready" 1 "${_GKE_READY} replica(s)" \
+    || _chk 1 "GKE deployment ready" 0 "readyReplicas=${_GKE_READY:-0}"
+fi
+
+_HEALTH=$(curl -sf "${BACKEND_URL}/health" --max-time 10 2>/dev/null \
+  | python3 -c "import sys,json;print(json.load(sys.stdin).get('status','ok'))" 2>/dev/null || echo "")
+[[ -n "$_HEALTH" ]] \
+  && _chk 2 "GET /health → ${_HEALTH}" 1 \
+  || _chk 2 "GET /health → unreachable" 0
+
+_CR_FRONTEND=$(gcloud run services describe "$FRONTEND_SVC" \
+  --region="$GCP_REGION" --project="$GCP_PROJECT" \
+  --format="value(status.conditions[0].status)" 2>/dev/null || echo "unknown")
+[[ "$_CR_FRONTEND" == "True" ]] \
+  && _chk 3 "Cloud Run frontend ready" 1 \
+  || _chk 3 "Cloud Run frontend ready" 0 "status: ${_CR_FRONTEND}"
+
+_HTTP=$(curl -sf -o /dev/null -w "%{http_code}" "$FRONTEND_URL" --max-time 10 2>/dev/null || echo "000")
+[[ "$_HTTP" == "200" ]] \
+  && _chk 4 "GET frontend → 200" 1 \
+  || _chk 4 "GET frontend → 200" 0 "HTTP $_HTTP"
+
+printf '\n  Results: %d passed, %d failed\n' "$_CP" "$_CF"
+(( _CF > 0 )) && printf '\n  !! %d CHECK(S) FAILED — review above before presenting\n' "$_CF" || true
 
 printf '\nTear down: ./scripts/infra-down.sh\n'
